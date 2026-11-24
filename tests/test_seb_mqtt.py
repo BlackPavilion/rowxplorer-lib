@@ -155,7 +155,8 @@ def test_connect_signs_url_and_sets_ws_options():
     # mandatory handshake header
     assert fake.ws_headers == {"Sec-WebSocket-Protocol": "mqtt"}
     assert fake.tls_kwargs["cert_reqs"] is not None
-    assert fake.client_id.startswith("#python-")
+    assert fake.client_id.startswith("#")
+    assert len(fake.client_id) > 10
 
 
 def test_connect_without_endpoint_raises():
@@ -563,3 +564,97 @@ def test_status_subscription_is_renewed_after_reconnect():
     client.disconnect()
     client.connect()
     assert fake.subscriptions == [STATUS_TOPIC, STATUS_TOPIC]
+
+
+def test_broker_disconnect_stops_old_client_and_resubscribes():
+    import time
+
+    created: list[FakeMqttClient] = []
+
+    class TrackingFake(FakeMqttClient):
+        def __init__(self, cid: str):
+            super().__init__(
+                cid,
+                respond_with={f"VAC001/{ROBOT_ID}/getStatus": (STATUS_TOPIC, STATUS_PAYLOAD)},
+            )
+            self.loop_stopped = 0
+            self.disconnected = 0
+
+        def loop_stop(self):
+            self.loop_stopped += 1
+
+        def disconnect(self):
+            self.disconnected += 1
+            super().disconnect()
+
+    def factory(cid: str) -> TrackingFake:
+        f = TrackingFake(cid)
+        created.append(f)
+        return f
+
+    cfg = SebMqttConfig(mqtt_endpoint=HOST, robot_id=ROBOT_ID)
+    client = SebMqttClient(cfg, StubAuth(), client_factory=factory, status_callback=lambda _: None)
+
+    assert client.status()["battery"] == 100
+    first = created[0]
+    assert first.subscriptions == [STATUS_TOPIC]
+
+    # Simulate an unsolicited broker disconnect between polls.
+    first.on_disconnect(first, None, None, 7)
+    time.sleep(0.05)
+    assert first.loop_stopped == 1
+    assert first.disconnected == 1
+    assert client._connected is False
+    assert not client._subscribed
+
+    # Next request opens a fresh client with a new client_id and re-subscribes.
+    assert client.status()["battery"] == 100
+    second = created[1]
+    assert second.client_id != first.client_id
+    assert second.subscriptions == [STATUS_TOPIC]
+
+    # Late callbacks from the detached client are ignored.
+    first.on_disconnect(first, None, None, 7)
+    assert client._connected is True
+    client.disconnect()
+    assert second.loop_stopped == 1
+
+
+def test_proactive_session_rotation_before_cognito_expiry():
+    import time
+
+    from rowxplorer_lib.seb_mqtt import SESSION_REFRESH_MARGIN
+
+    created: list[FakeMqttClient] = []
+    expiring_creds = IamCredentials(
+        access_key_id="AK",
+        secret_key="SK",
+        session_token="ST",
+        expiration=time.time() + SESSION_REFRESH_MARGIN - 5,
+    )
+
+    class TrackingFake(FakeMqttClient):
+        def __init__(self, cid: str):
+            super().__init__(
+                cid,
+                respond_with={f"VAC001/{ROBOT_ID}/getStatus": (STATUS_TOPIC, STATUS_PAYLOAD)},
+            )
+            self.loop_stopped = 0
+
+        def loop_stop(self):
+            self.loop_stopped += 1
+
+    def factory(cid: str) -> TrackingFake:
+        f = TrackingFake(cid)
+        created.append(f)
+        return f
+
+    cfg = SebMqttConfig(mqtt_endpoint=HOST, robot_id=ROBOT_ID)
+    client = SebMqttClient(cfg, StubAuth(expiring_creds), client_factory=factory)
+    client.status()
+    assert len(created) == 1
+    # Second call sees credentials within SESSION_REFRESH_MARGIN and rotates.
+    client.status()
+    assert len(created) == 2
+    assert created[0].loop_stopped == 1
+    client.disconnect()

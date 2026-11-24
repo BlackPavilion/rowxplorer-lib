@@ -24,6 +24,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,6 +47,9 @@ DEFAULT_REGION = "eu-west-1"
 DEFAULT_PRODUCT_ID = "VAC001"
 SERVICE = "iotdata"
 WS_PATH = "/mqtt"
+# Proactively rotate the MQTT WSS session before Cognito IAM credentials expire
+# (~1 h) so AWS IoT does not drop the socket mid-session.
+SESSION_REFRESH_MARGIN = 420.0
 
 
 def sign_websocket_url(
@@ -111,7 +115,7 @@ class SebMqttConfig:
         region: AWS region (``eu-west-1``).
         product_id: thing type (``VAC001``).
         robot_id: appliance asset id (the robot UUID).
-        client_id: MQTT client id (default: ``#python-<uuid>``).
+        client_id: MQTT client id (default: ``#<uuid>`` per connection).
         keepalive: MQTT keepalive in seconds.
         timeout: request/response timeout in seconds.
         connect_timeout: CONNACK timeout in seconds.
@@ -159,8 +163,9 @@ class SebMqttClient:
     The client connects lazily on the first request (or explicitly via
     :meth:`connect`). ``client_factory`` can be injected for testing.
 
-    Note: the signed URL is valid for ~15 min; long-lived sessions should
-    reconnect (``disconnect()`` + ``connect()``) before it expires.
+    Long-lived sessions automatically rotate before the Cognito IAM
+    credentials expire, and broker-initiated disconnects stop the paho
+    background thread cleanly so it never retries with an expired SigV4 URL.
     """
 
     def __init__(
@@ -175,6 +180,7 @@ class SebMqttClient:
         self._factory = client_factory or self._default_factory
         self._client: Any | None = None
         self._connected = False
+        self._creds_expiration: float | None = None
         self._connect_error: str | None = None
         self._connected_event = threading.Event()
         self._lock = threading.Lock()
@@ -200,18 +206,36 @@ class SebMqttClient:
                 client_id=client_id, protocol=mqtt.MQTTv311, transport="websockets"
             )
 
+    @staticmethod
+    def _cleanup_client(client: Any) -> None:
+        """Stop a paho client's network thread and close its socket."""
+        try:
+            client.disconnect()
+        except Exception:  # noqa: BLE001, S110 - best-effort cleanup
+            pass
+        try:
+            client.loop_stop()
+        except Exception:  # noqa: BLE001, S110 - best-effort cleanup
+            pass
+
     def connect(self) -> None:
         """Authenticate (Cognito), sign the WSS URL and connect."""
         if self._connected:
             return
         if not self.config.mqtt_endpoint:
             raise RowxplorerConnectionError("mqtt_endpoint is not configured")
+        # Always tear down any previous paho client before creating a new one
+        # so its background network thread is never leaked.
+        if self._client is not None:
+            self.disconnect()
         creds = self.auth.cognito_credentials()
         query = sign_websocket_url(
             creds, region=self.config.region, host=self.config.mqtt_endpoint
         )
-        client_id = self.config.client_id or f"#python-{uuid.uuid4()}"
+        client_id = self.config.client_id or f"#{uuid.uuid4()}"
         client = self._factory(client_id)
+        if hasattr(client, "reconnect_delay_set"):
+            client.reconnect_delay_set(min_delay=30, max_delay=300)
         client.ws_set_options(
             path=f"{WS_PATH}?{query}", headers={"Sec-WebSocket-Protocol": "mqtt"}
         )
@@ -219,13 +243,17 @@ class SebMqttClient:
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
-        self._client = client
+        with self._lock:
+            self._client = client
+            self._subscribed.clear()
         self._connect_error = None
         self._connected_event.clear()
         try:
             client.connect(self.config.mqtt_endpoint, 443, keepalive=self.config.keepalive)
         except Exception as exc:
-            self._client = None
+            with self._lock:
+                if self._client is client:
+                    self._client = None
             raise RowxplorerConnectionError(
                 f"MQTT connect to {self.config.mqtt_endpoint} failed: {exc}"
             ) from exc
@@ -240,21 +268,22 @@ class SebMqttClient:
             self.disconnect()
             raise RowxplorerConnectionError(f"MQTT: connection refused: {self._connect_error}")
         self._connected = True
+        self._creds_expiration = creds.expiration
         if self.status_callback is not None:
             self._subscribe(self.config.topic("status"))
 
     def disconnect(self) -> None:
-        client, self._client = self._client, None
-        self._connected = False
         with self._lock:
+            client, self._client = self._client, None
+            self._connected = False
+            self._creds_expiration = None
             self._subscribed.clear()
+            for topic in list(self._waiters):
+                for ev, _slot in self._waiters.pop(topic):
+                    ev.set()
         if client is None:
             return
-        try:
-            client.loop_stop()
-            client.disconnect()
-        except Exception:  # noqa: BLE001, S110 - best-effort cleanup
-            pass
+        self._cleanup_client(client)
 
     def __enter__(self) -> SebMqttClient:  # noqa: PYI034 - Self needs py3.11
         self.connect()
@@ -265,6 +294,13 @@ class SebMqttClient:
 
     # -- low-level -------------------------------------------------------------
     def _ensure_connected(self) -> None:
+        if (
+            self._connected
+            and self._creds_expiration is not None
+            and time.time() >= self._creds_expiration - SESSION_REFRESH_MARGIN
+        ):
+            _LOGGER.debug("Rotating MQTT WSS session before Cognito credentials expire")
+            self.disconnect()
         if not self._connected:
             self.connect()
 
@@ -275,10 +311,11 @@ class SebMqttClient:
 
     def _subscribe(self, topic: str) -> None:
         with self._lock:
-            if topic in self._subscribed:
+            client = self._client
+            if client is None or topic in self._subscribed:
                 return
             self._subscribed.add(topic)
-        self._client.subscribe(topic, qos=0)
+        client.subscribe(topic, qos=0)
 
     def request(
         self,
@@ -299,9 +336,12 @@ class SebMqttClient:
         ev = threading.Event()
         slot: dict[str, Any] = {}
         with self._lock:
+            client = self._client
+            if client is None:
+                raise RowxplorerConnectionError(f"not connected when requesting {sub_topic}")
             self._waiters.setdefault(sub_topic, []).append((ev, slot))
         self._subscribe(sub_topic)
-        info = self._client.publish(pub_topic, payload, qos=0)
+        info = client.publish(pub_topic, payload, qos=0)
         if getattr(info, "rc", 0) != 0:
             self._drop_waiter(sub_topic, ev)
             raise RowxplorerConnectionError(f"publish to {pub_topic} failed (rc={info.rc})")
@@ -325,11 +365,15 @@ class SebMqttClient:
     def _on_connect(
         self, client: Any, userdata: Any, flags: Any, rc: Any, properties: Any = None
     ) -> None:
+        if client is not self._client:
+            return
         if not _connect_ok(rc):
             self._connect_error = str(getattr(rc, "name", rc))
         self._connected_event.set()
 
     def _on_message(self, client: Any, userdata: Any, msg: Any) -> None:
+        if client is not self._client:
+            return
         try:
             data = json.loads(msg.payload.decode("utf-8", "replace"))
         except ValueError:
@@ -356,11 +400,24 @@ class SebMqttClient:
     def _on_disconnect(
         self, client: Any, userdata: Any, flags: Any, rc: Any, properties: Any = None
     ) -> None:
-        self._connected = False
         with self._lock:
+            if client is not self._client:
+                return
+            self._client = None
+            self._connected = False
+            self._creds_expiration = None
+            self._subscribed.clear()
             for topic in list(self._waiters):
                 for ev, _slot in self._waiters.pop(topic):
                     ev.set()
+        # Stop the detached paho network thread from outside its callback so it
+        # does not keep reconnecting with an expired SigV4 WebSocket URL.
+        threading.Thread(
+            target=self._cleanup_client,
+            args=(client,),
+            name="seb-mqtt-cleanup",
+            daemon=True,
+        ).start()
 
     # -- high-level: status / history ---------------------------------------------
     def status(self, timeout: float | None = None) -> dict[str, Any]:
@@ -381,7 +438,10 @@ class SebMqttClient:
         self._ensure_connected()
         topic = self.config.topic("command")
         data = payload if isinstance(payload, str) else json.dumps(payload)
-        info = self._client.publish(topic, data, qos=0)
+        client = self._client
+        if client is None:
+            raise RowxplorerConnectionError(f"not connected when publishing to {topic}")
+        info = client.publish(topic, data, qos=0)
         if getattr(info, "rc", 0) != 0:
             raise RowxplorerConnectionError(f"publish to {topic} failed (rc={info.rc})")
         return {"published": True, "topic": topic, "mid": getattr(info, "mid", None)}
@@ -441,7 +501,10 @@ class SebMqttClient:
             return self.command(params)
         self._ensure_connected()
         topic = self.config.topic(name)
-        info = self._client.publish(topic, json.dumps(params) if params else "{}", qos=0)
+        client = self._client
+        if client is None:
+            raise RowxplorerConnectionError(f"not connected when publishing to {topic}")
+        info = client.publish(topic, json.dumps(params) if params else "{}", qos=0)
         if getattr(info, "rc", 0) != 0:
             raise RowxplorerConnectionError(f"publish to {topic} failed (rc={info.rc})")
         return {"published": True, "topic": topic, "mid": getattr(info, "mid", None)}
